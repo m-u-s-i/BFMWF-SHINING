@@ -15,6 +15,7 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL20;
 
+import cloud.siz.atomic.api.render.AtomicForwardLightingApi;
 import cloud.siz.atomic.api.render.AtomicGBufferCompat;
 
 /**
@@ -27,12 +28,30 @@ public final class AtomicShaderCompat {
     public static final String MODID = "siz_atomicshader";
 
     private static ResourceLocation currentFillAlbedo;
+    /** Colorized overlay (laser) that must survive {@code rebindFillAndGunPbr} resetSession. */
+    private static boolean meshFlatEmissive;
+    private static float meshTintR = 1f;
+    private static float meshTintG = 1f;
+    private static float meshTintB = 1f;
+    private static float meshTintA = 1f;
+
+    private static final java.util.HashMap<String, Integer> GLOW_GL_ID_CACHE = new java.util.HashMap<>();
+    private static boolean atomicLoadedResolved;
+    private static boolean atomicLoaded;
 
     private AtomicShaderCompat() {
     }
 
+    public static void clearGlowMapCache() {
+        GLOW_GL_ID_CACHE.clear();
+    }
+
     public static boolean isAtomicLoaded() {
-        return Loader.isModLoaded(MODID);
+        if (!atomicLoadedResolved) {
+            atomicLoaded = Loader.isModLoaded(MODID);
+            atomicLoadedResolved = true;
+        }
+        return atomicLoaded;
     }
 
     public static boolean isAvailable() {
@@ -57,14 +76,7 @@ public final class AtomicShaderCompat {
         return isPipelineEnabled() && AtomicGBufferCompat.isPipelineTakingOverExternalMeshes();
     }
 
-    /**
-     * When Atomic owns deferred mesh: skip color draws outside fill/shadow
-     * (avoids fullbright forward dual-paint). When master is off, never skip.
-     * <p>
-     * Inventory / container entity previews ({@code GuiInventory.drawEntityOnScreen}
-     * etc.) run after the world fill session with no fill active — must not skip
-     * or held MWF guns (and ELM-bound previews' weapons) stay invisible.
-     */
+    /** Skip forward color when Atomic owns deferred mesh (except open GUIs). */
     public static boolean shouldSkipLegacyColorDraw() {
         if (!isPipelineEnabled()) {
             return false;
@@ -84,6 +96,31 @@ public final class AtomicShaderCompat {
         return isShadowDepthActive();
     }
 
+    /** TEX1 lightmap + MultiTexCoord1; call before final TEX0 albedo bind. */
+    public static void ensureFillLightmapState() {
+        if (!isGBufferFillActive() || isShadowDepthActive()) {
+            return;
+        }
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        OpenGlHelper.setClientActiveTexture(OpenGlHelper.defaultTexUnit);
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc != null && mc.entityRenderer != null) {
+            try {
+                mc.entityRenderer.enableLightmap();
+            } catch (Throwable ignored) {
+            }
+        }
+        OpenGlHelper.setLightmapTextureCoords(
+                OpenGlHelper.lightmapTexUnit,
+                OpenGlHelper.lastBrightnessX,
+                OpenGlHelper.lastBrightnessY);
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        OpenGlHelper.setClientActiveTexture(OpenGlHelper.defaultTexUnit);
+        GlStateManager.matrixMode(GL11.GL_TEXTURE);
+        GlStateManager.loadIdentity();
+        GlStateManager.matrixMode(GL11.GL_MODELVIEW);
+    }
+
     public static void rebindFillIfActive() {
         if (!isPipelineEnabled()) {
             return;
@@ -92,9 +129,23 @@ public final class AtomicShaderCompat {
     }
 
     /**
-     * Skin / morph / raw GL20 program steals: Atomic FillCaptureGuard may not see HE-LWJGL3
-     * {@code GL20.glUseProgram}; force the next fill rebind to run.
+     * Upload ParticleForward-equivalent sky + custom lights onto a bound peer program.
+     * {@code false} when Atomic is absent / master off — keep vanilla lightmap.
      */
+    public static boolean applyForwardLighting(int programId) {
+        if (!isForwardLightingActive() || programId <= 0) {
+            return false;
+        }
+        AtomicForwardLightingApi.applyToBoundProgram(programId);
+        return true;
+    }
+
+    /** True when peers should bind Atomic sky + custom-light uniforms instead of vanilla lightmap. */
+    public static boolean isForwardLightingActive() {
+        return isPipelineEnabled() && AtomicForwardLightingApi.isActive();
+    }
+
+    /** Force next fill rebind after raw {@code GL20.glUseProgram} changes. */
     public static void markFillCaptureDirty() {
         if (!isPipelineEnabled()) {
             return;
@@ -102,10 +153,7 @@ public final class AtomicShaderCompat {
         AtomicGBufferCompat.markFillCaptureDirty();
     }
 
-    /**
-     * After TextureManager preload of gun/item albedo (+ {@code _n}/{@code _s}): warm Atomic's
-     * decoded PBR cache so first FP draw does not ImageIO/decode on the render thread.
-     */
+    /** Warm decoded PBR cache for an albedo location. */
     public static void warmStandalonePbrMaps(ResourceLocation albedo) {
         if (!isAtomicLoaded() || albedo == null) {
             return;
@@ -174,31 +222,31 @@ public final class AtomicShaderCompat {
         if (albedo == null || !isGBufferFillActive() || isShadowDepthActive()) {
             return;
         }
-        if (albedo.equals(currentFillAlbedo) && AtomicGBufferCompat.isFillProgramBound()) {
+        if (mchhui.hegltf.GltfFeatureFlags.renderSchedulingOpt()
+                && albedo.equals(currentFillAlbedo) && AtomicGBufferCompat.isFillProgramBound()) {
             return;
         }
         currentFillAlbedo = albedo;
         rebindFillIfActive();
-        // EntityPbrTextureCache.uploadRgba may leave TEX0 unbound (bindTexture(0));
-        // re-bind albedo with fill program active so _n/_s hot-swap runs, then restore filter.
         Minecraft.getMinecraft().getTextureManager().bindTexture(albedo);
         TextureSamplingRegistry.restoreAlbedoSampling(albedo);
     }
 
     /**
-     * After morph / FBO steal: restore fill MRT and re-bind {@code currentFillAlbedo} (gun / item /
-     * armor / skin — whatever the peer last adopted). Not a gun-only helper despite the name.
-     * Call only when that albedo is still the mesh about to draw; never use this to "fix" arms
-     * after a stale held-item albedo (bind skin via {@link #bindFillAlbedo} instead).
-     * <p>
-     * Always restores capture when called — HE/MWF may change program via {@code GL20.glUseProgram}
-     * without going through OpenGlHelper; do not skip based on a Java fill-bound flag alone.
+     * Restore fill MRT and re-bind {@code currentFillAlbedo}.
+     * Call only when that albedo matches the mesh about to draw.
      */
     public static void rebindFillAndGunPbr() {
         if (!isGBufferFillActive() && !isShadowDepthActive()) {
             return;
         }
+        if (isGBufferFillActive()) {
+            markFillCaptureDirty();
+        }
         rebindAtomicCaptureIfActive();
+        if (isGBufferFillActive()) {
+            ensureFillLightmapState();
+        }
         TextureSamplingRegistry.restoreDefaultTexUnit();
         if (currentFillAlbedo != null && isGBufferFillActive() && !isShadowDepthActive()) {
             Minecraft.getMinecraft().getTextureManager().bindTexture(currentFillAlbedo);
@@ -210,11 +258,84 @@ public final class AtomicShaderCompat {
         currentFillAlbedo = null;
     }
 
+    public static ResourceLocation getCurrentFillAlbedo() {
+        return currentFillAlbedo;
+    }
+
     /**
-     * Player skin location that is safe to sample. When the network skin is not registered yet
-     * or resolves to {@link TextureUtil#MISSING_TEXTURE} (purple), fall back to
-     * {@link DefaultPlayerSkin} — enter-world / switch-save FP arms otherwise go purple.
+     * Fullbright colored overlay during fill (laserModel). Fill rebind resets emissive,
+     * so {@link #applyMeshFlatEmissiveIfActive()} must run again after that rebind.
+     * VAO draws often ignore {@code glColor}; callers should also bind a tinted albedo.
      */
+    public static void beginMeshFlatEmissive() {
+        beginMeshFlatEmissive(1f, 1f, 1f, 1f);
+    }
+
+    public static void beginMeshFlatEmissive(float r, float g, float b, float a) {
+        meshFlatEmissive = true;
+        meshTintR = clamp01(r);
+        meshTintG = clamp01(g);
+        meshTintB = clamp01(b);
+        meshTintA = clamp01(a);
+        setEmissiveFlat(1f);
+        applyMeshTintGl();
+    }
+
+    public static void endMeshFlatEmissive() {
+        meshFlatEmissive = false;
+        meshTintR = 1f;
+        meshTintG = 1f;
+        meshTintB = 1f;
+        meshTintA = 1f;
+        clearEmissive();
+        applyMeshTintGl();
+    }
+
+    /**
+     * Re-apply after {@code rebindFillAndGunPbr}. {@code true} means skip glow-map
+     * {@code max(albedo, glow)} which would wash a white laser albedo to white.
+     */
+    public static boolean applyMeshFlatEmissiveIfActive() {
+        if (!meshFlatEmissive || !isGBufferFillActive() || isShadowDepthActive()) {
+            return false;
+        }
+        setEmissiveFlat(1f);
+        applyMeshTintGl();
+        return true;
+    }
+
+    /** After VAO bind: generic attrib 3 ({@code gl_Color}) is not stored in most MWF VAOs. */
+    public static void reapplyMeshTintGlIfActive() {
+        if (!meshFlatEmissive) {
+            return;
+        }
+        applyMeshTintGl();
+        try {
+            GL11.glDisableClientState(GL11.GL_COLOR_ARRAY);
+            GL20.glDisableVertexAttribArray(3);
+            GL20.glVertexAttrib4f(3, meshTintR, meshTintG, meshTintB, meshTintA);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static float clamp01(float v) {
+        return v < 0f ? 0f : (v > 1f ? 1f : v);
+    }
+
+    /**
+     * Compatibility {@code gl_Color} is attrib 3. Do not disable arrays here — a previous
+     * mesh VAO may still be bound during batching. After the laser VAO bind, call
+     * {@link #reapplyMeshTintGlIfActive()}.
+     */
+    private static void applyMeshTintGl() {
+        GlStateManager.color(meshTintR, meshTintG, meshTintB, meshTintA);
+        try {
+            GL20.glVertexAttrib4f(3, meshTintR, meshTintG, meshTintB, meshTintA);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Prefer registered player skin; else default Steve/Alex. */
     public static ResourceLocation resolveReadyPlayerSkin(AbstractClientPlayer player) {
         if (player == null) {
             return DefaultPlayerSkin.getDefaultSkinLegacy();
@@ -245,10 +366,7 @@ public final class AtomicShaderCompat {
         }
     }
 
-    /**
-     * Bind a ready player skin (or Steve/Alex default). Atomic PBR fill hooks only when
-     * pipeline master is on; otherwise this is a plain TextureManager bind (MWF purple-skin fix).
-     */
+    /** Bind ready player skin; PBR fill hooks when pipeline is active. */
     public static ResourceLocation bindReadyPlayerSkin() {
         AbstractClientPlayer player = Minecraft.getMinecraft().player;
         ResourceLocation skin = resolveReadyPlayerSkin(player);
@@ -289,13 +407,8 @@ public final class AtomicShaderCompat {
     }
 
     /**
-     * Start opaque mesh capture while Atomic Hand/Entity fill is active: disable soft blend
-     * (SrcA into MRT → black fringes) and restore fill + last albedo PBR maps.
-     * Soft translucent layers must use {@code finishHandDeferredIfActive} (FP) or
-     * {@code AtomicExternalDrawEvent.EntityForwardOverlay} after composite — not this path.
-     * <p>
-     * Call {@link #bindFillAlbedo} / {@link #ensurePbrMapsForBoundAlbedo} for the mesh about to
-     * draw <b>before</b> this, or {@link #rebindFillAndGunPbr} will restore a stale item albedo.
+     * Start opaque fill capture: disable blend, restore fill + albedo PBR.
+     * Bind mesh albedo before calling.
      */
     public static void beginOpaqueFillCapture() {
         if (!isGBufferFillActive() || isShadowDepthActive()) {
@@ -317,10 +430,7 @@ public final class AtomicShaderCompat {
         rebindFillAndGunPbr();
     }
 
-    /**
-     * Soft alpha FX (muzzle flash / smoke) must not {@code enableBlend} into Hand/Entity MRT:
-     * SrcA blend fades RGB into clear(0) → black fringes. Use replace + alpha discard instead.
-     */
+    /** Soft FX on fill: replace + alpha test (no SrcA blend into MRT). */
     public static void beginCutoutEmissiveFx() {
         if (!isGBufferFillActive() || isShadowDepthActive()) {
             return;
@@ -342,10 +452,7 @@ public final class AtomicShaderCompat {
         }
     }
 
-    /**
-     * If Atomic fill is active and a glow map exists, bind emissive on TEX4 and return true
-     * (caller draws albedo once, then {@link #clearEmissive()}). Otherwise return false for legacy pass.
-     */
+    /** Bind glow map on TEX4 during fill; {@code false} → use legacy glow path. */
     public static boolean prepareGlowMapEmissive(String type, String fileName) {
         if (!isGBufferFillActive() || isShadowDepthActive() || type == null || fileName == null) {
             return false;
@@ -361,21 +468,42 @@ public final class AtomicShaderCompat {
 
     /**
      * Resolve {@code skins/<type>/<file>_glow.png} GL id without leaving it on TEX0.
-     * Does <b>not</b> eager-load missing glows (avoids SimpleTexture side effects / filter leaks).
+     * Returns {@code 0} if absent.
      */
     public static int resolveGlowGlTextureId(String type, String fileName) {
+        if (type == null || fileName == null) {
+            return 0;
+        }
+        String cacheKey = type + "/" + fileName;
+        Integer cached = GLOW_GL_ID_CACHE.get(cacheKey);
+        if (cached != null) {
+            return cached.intValue();
+        }
         ResourceLocation loc = new ResourceLocation(com.modularwarfare.ModularWarfare.MOD_ID,
                 String.format("skins/%s/%s_glow.png", type, fileName));
         Minecraft mc = Minecraft.getMinecraft();
         ITextureObject tex = mc.getTextureManager().getTexture(loc);
         if (tex == null || tex == TextureUtil.MISSING_TEXTURE) {
+            try {
+                mc.getResourceManager().getResource(loc);
+                mc.getTextureManager().bindTexture(loc);
+                tex = mc.getTextureManager().getTexture(loc);
+            } catch (Throwable t) {
+                GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(0));
+                return 0;
+            }
+        }
+        if (tex == null || tex == TextureUtil.MISSING_TEXTURE) {
+            GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(0));
             return 0;
         }
         try {
             if (tex.getGlTextureId() == TextureUtil.MISSING_TEXTURE.getGlTextureId()) {
+                GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(0));
                 return 0;
             }
         } catch (Throwable t) {
+            GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(0));
             return 0;
         }
         int prevActive = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
@@ -387,8 +515,11 @@ public final class AtomicShaderCompat {
             GlStateManager.setActiveTexture(GL13.GL_TEXTURE5);
             prevTex5 = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
             GlStateManager.bindTexture(tex.getGlTextureId());
-            return tex.getGlTextureId();
+            int id = tex.getGlTextureId();
+            GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(id));
+            return id;
         } catch (Throwable t) {
+            GLOW_GL_ID_CACHE.put(cacheKey, Integer.valueOf(0));
             return 0;
         } finally {
             try {

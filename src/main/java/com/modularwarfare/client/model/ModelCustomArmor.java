@@ -20,7 +20,6 @@ import com.modularwarfare.common.guns.ItemGun;
 import com.modularwarfare.common.guns.WeaponAnimationType;
 import com.modularwarfare.common.type.BaseItem;
 import com.modularwarfare.common.type.BaseType;
-import com.mrcrayfish.obfuscate.client.event.ModelPlayerEvent;
 
 import mchhui.hegltf.GltfRenderModel;
 import mchhui.hegltf.GltfRenderModel.NodeAnimationMapper;
@@ -70,7 +69,7 @@ public class ModelCustomArmor extends MWModelBipedBase {
         }
         if(this.config.extra.enhancedArmModel!=null) {
             enhancedArmModel=new EnhancedModel(new EnhancedRenderConfig(this.config.extra.enhancedArmModel, 24), type);
-            // Lazy: do not parse GLTF during content-pack boot (avoids racing early Sound/OpenAL init).
+            // Lazy GLTF resolve.
             enhancedArmModel.setAnimationLoadMapper(new NodeAnimationMapper(null) {
                 @Override
                 public void handle(GltfRenderModel model, GltfRenderModel other, String target) {

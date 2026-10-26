@@ -7,8 +7,6 @@ import com.google.gson.stream.JsonReader;
 import com.modularwarfare.api.ItemRegisterEvent;
 import com.modularwarfare.api.hebridge.IAniPlayer;
 import com.modularwarfare.api.hebridge.IHEBlockExplosionResistance;
-import com.modularwarfare.client.customplayer.CPEventHandler;
-import com.modularwarfare.client.customplayer.CustomPlayerConfig;
 import com.modularwarfare.client.fpp.enhanced.AnimationType.AnimationTypeJsonAdapter.AnimationTypeException;
 import com.modularwarfare.client.gui.hud.GunTransformHUD;
 import com.modularwarfare.common.CommonProxy;
@@ -56,7 +54,6 @@ import com.modularwarfare.utility.bukkit.BukkitEvents;
 import com.modularwarfare.utility.raycast.DefaultRayCasting;
 import com.modularwarfare.utility.raycast.RayCasting;
 import com.modularwarfare.utility.script.ScriptHost;
-import com.mrcrayfish.vehicle.client.HeldVehicleEvents;
 
 import mchhui.modularmovements.ModularMovements;
 import moe.komi.mwprotect.IZip;
@@ -106,7 +103,7 @@ public class ModularWarfare {
     // Mod Info
     public static final String MOD_ID = "modularwarfare";
     public static final String MOD_NAME = "ModularWarfare";
-    public static final String MOD_VERSION = "2024.2.4.6f";
+    public static final String MOD_VERSION = "2026.2.4.7f";
     public static final String MOD_PREFIX = TextFormatting.GRAY + "[" + TextFormatting.RED + "ModularWarfare" + TextFormatting.GRAY + "]" + TextFormatting.GRAY;
 
     // Main instance
@@ -170,11 +167,15 @@ public class ModularWarfare {
         try {
             Class<?> protectorClass = Class.forName("moe.komi.mwprotect.cipher.ProtectZip");
             Constructor<?> constructor = protectorClass.getConstructor(File.class);
-            return (IZip)constructor.newInstance(file);
+            return (IZip) constructor.newInstance(file);
         } catch (InvocationTargetException e) {
-            LOGGER.error("Failed to construct ProtectZip", e);
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            LOGGER.error("Failed to construct ProtectZip for '{}'", file.getName(), e);
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException("Failed to open protected content pack: " + file.getName(), cause);
         } catch (ClassNotFoundException | NoSuchMethodException | InstantiationException | IllegalAccessException ignored) {
-            // Pass
         }
         return new LegacyZip(file);
     }
@@ -362,35 +363,6 @@ public class ModularWarfare {
                 /*
                  * LOAD SCRIPT END
                  */
-                /*
-                 * LOAD CUSTOM PLAYER START
-                 */
-                CPEventHandler.cpConfig.clear();
-                File cpFolder = new File(file, "/customplayer/");
-                if (cpFolder.exists()) {
-                    for (File typeFile : cpFolder.listFiles()) {
-                        System.out.println("test1:" + typeFile.getName());
-                        if (typeFile.getName().endsWith(".json")) {
-                            String text = "";
-                            try {
-                                BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8));
-                                String temp;
-                                while ((temp = bufferedReader.readLine()) != null) {
-                                    text += temp;
-                                }
-                                bufferedReader.close();
-                                CustomPlayerConfig cp = gson.fromJson(text, CustomPlayerConfig.class);
-                                CPEventHandler.cpConfig.put(cp.name, cp);
-                            } catch (IOException e) {
-                                // TODO Auto-generated catch block
-                                e.printStackTrace();
-                            }
-                        }
-                    }
-                }
-                /*
-                 * LOAD CUSTOM PLAYER END
-                 */
             } else {
                 if (zipContentsPack.containsKey(file.getName())) {
                     for (IZipEntry fileHeader : zipContentsPack.get(file.getName()).fileHeaders) {
@@ -447,31 +419,6 @@ public class ModularWarfare {
                         /*
                          * LOAD SCRIPT END
                          */
-                        /*
-                         * LOAD CUSTOM PLAYER START
-                         */
-                        zipName = fileHeader.getFileName();
-                        if (zipName.startsWith("customplayer/") && zipName.endsWith(".json")) {
-                            String typeFile = zipName.replaceFirst("customplayer/", "").replace(".json", "");
-                            String text = "";
-                            try {
-                                InputStream inputStream = fileHeader.getInputStream();
-                                BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8));
-                                String temp;
-                                while ((temp = bufferedReader.readLine()) != null) {
-                                    text += temp;
-                                }
-                                bufferedReader.close();
-                                CustomPlayerConfig cp = gson.fromJson(text, CustomPlayerConfig.class);
-                                CPEventHandler.cpConfig.put(cp.name, cp);
-                            } catch (IOException e) {
-                                // TODO Auto-generated catch block
-                                e.printStackTrace();
-                            }
-                        }
-                        /*
-                         * LOAD CUSTOM PLAYER END
-                         */
                     }
                 }
             }
@@ -481,14 +428,17 @@ public class ModularWarfare {
     private void checkModCompat() {
         if (Loader.isModLoaded("obfuscate")) {
             isLoadedObfuscate = true;
-            Field f;
+        }
+        // Soft dependency: tell Vehicle not to double-patch player layers when MWF FakeRenderPlayer already added LayerHeldVehicle.
+        if (isLoadedObfuscate && Loader.isModLoaded("vehicle")
+                && FMLCommonHandler.instance().getSide().isClient()) {
             try {
-                f = HeldVehicleEvents.class.getDeclaredField("setupExtraLayers");
+                Class<?> heldEvents = Class.forName("com.mrcrayfish.vehicle.client.HeldVehicleEvents");
+                Field f = heldEvents.getDeclaredField("setupExtraLayers");
                 f.setAccessible(true);
                 f.set(null, Boolean.TRUE);
-            } catch (NoSuchFieldException | SecurityException | NoClassDefFoundError | IllegalArgumentException | IllegalAccessException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
+            } catch (Throwable t) {
+                ModularWarfare.LOGGER.warn("[MWF] Could not mark HeldVehicleEvents.setupExtraLayers", t);
             }
         }
     }

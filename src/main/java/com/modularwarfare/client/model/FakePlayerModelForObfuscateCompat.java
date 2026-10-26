@@ -1,6 +1,7 @@
 package com.modularwarfare.client.model;
 
 import com.modularwarfare.ModularWarfare;
+import com.modularwarfare.client.ClientRenderHooks;
 import com.modularwarfare.client.fpp.enhanced.configs.GunEnhancedRenderConfig;
 import com.modularwarfare.common.guns.GunType;
 import com.modularwarfare.common.guns.ItemGun;
@@ -100,6 +101,7 @@ public class FakePlayerModelForObfuscateCompat extends ModelPlayer {
             }
         }
         this.setupRotationAngles();
+        ClientRenderHooks.applyRideUpperBodyTwist(this, entityIn);
     }
 
     @Override

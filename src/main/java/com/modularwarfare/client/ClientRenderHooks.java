@@ -23,6 +23,7 @@ import com.modularwarfare.client.compat.AtomicShaderCompat;
 import com.modularwarfare.client.flashlight.FlashlightRenderManager;
 import com.modularwarfare.client.model.ModelCustomArmor;
 import com.modularwarfare.client.scope.ScopeUtils;
+import com.modularwarfare.client.view.ShoulderAimCorrect;
 import com.modularwarfare.common.armor.ArmorType;
 import com.modularwarfare.common.armor.ItemMWArmor;
 import com.modularwarfare.common.armor.ItemSpecialArmor;
@@ -34,6 +35,7 @@ import com.modularwarfare.common.guns.*;
 import com.modularwarfare.common.melee.ItemMelee;
 import com.modularwarfare.common.melee.MeleeType;
 import com.modularwarfare.common.network.PacketAimingRequest;
+import com.modularwarfare.common.network.PacketAimPoseSync;
 import com.modularwarfare.common.type.BaseItem;
 import com.modularwarfare.common.type.BaseType;
 import com.modularwarfare.utility.OptifineHelper;
@@ -46,6 +48,7 @@ import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.model.ModelBiped;
 import net.minecraft.client.model.ModelBiped.ArmPose;
 import net.minecraft.client.model.ModelPlayer;
+import net.minecraft.client.model.ModelRenderer;
 import net.minecraft.client.renderer.*;
 import net.minecraft.client.renderer.entity.Render;
 import net.minecraft.client.renderer.entity.RenderPlayer;
@@ -72,6 +75,7 @@ import org.lwjgl.util.glu.Project;
 
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.UUID;
 
 @SideOnly(Side.CLIENT)
 public class ClientRenderHooks {
@@ -95,6 +99,21 @@ public class ClientRenderHooks {
     public static final ResourceLocation grenade_smoke = new ResourceLocation("modularwarfare", "textures/particles/smoke.png");
     public static final ResourceLocation grenade_smoke_model = null;
 
+    private static final HashMap<UUID, SmoothAimPose> aimSmooth = new HashMap<UUID, SmoothAimPose>();
+    private static final HashMap<UUID, float[]> aimPitchBackup = new HashMap<UUID, float[]>();
+    private static long aimBodyLastNs;
+    private static float aimBodyFrameDt = 1f / 60f;
+    private static long aimSmoothRenderStamp;
+    private boolean lastSentAimPoseActive;
+
+    private static final class SmoothAimPose {
+        float lookYaw;
+        float lookPitch;
+        float bodyYaw;
+        float upperBodyTwistDeg;
+        boolean init;
+        long steppedStamp;
+    }
 
     public ClientRenderHooks() {
         mc = Minecraft.getMinecraft();
@@ -139,6 +158,18 @@ public class ClientRenderHooks {
     void renderTick(TickEvent.RenderTickEvent event) {
         switch (event.phase) {
             case START: {
+                long now = System.nanoTime();
+                if (aimBodyLastNs != 0L) {
+                    float dt = (now - aimBodyLastNs) * 1.0e-9f;
+                    if (dt < 0.001f) {
+                        dt = 0.001f;
+                    } else if (dt > 0.05f) {
+                        dt = 0.05f;
+                    }
+                    aimBodyFrameDt = dt;
+                }
+                aimBodyLastNs = now;
+                aimSmoothRenderStamp++;
                 RenderParameters.smoothing = event.renderTickTime;
                 SetPartialTick(event.renderTickTime);
                 if(!Minecraft.getMinecraft().getFramebuffer().isStencilEnabled()) {
@@ -180,14 +211,254 @@ public class ClientRenderHooks {
             }
         }
     }
-    
-    @SubscribeEvent(priority = EventPriority.HIGHEST)
-    void onRender(RenderPlayerEvent.Pre event) {
-        boolean aim = isThirdPersonAiming(event.getEntityPlayer().getUniqueID());
-        if (!aim) {
+
+    @SubscribeEvent
+    void onClientTickAimBody(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) {
             return;
         }
-        event.getEntityPlayer().renderYawOffset=interpolateRotation(event.getEntityPlayer().renderYawOffset,event.getEntityPlayer().rotationYaw,0.1f);
+        if (mc.world == null) {
+            return;
+        }
+        for (EntityPlayer player : mc.world.playerEntities) {
+            UUID id = player.getUniqueID();
+            if (!isThirdPersonAiming(id)) {
+                aimSmooth.remove(id);
+                aimPitchBackup.remove(id);
+                continue;
+            }
+            if (player == mc.player && mc.gameSettings.thirdPersonView == 0) {
+                aimSmooth.remove(id);
+                continue;
+            }
+            SmoothAimPose state = aimSmooth.get(id);
+            if (state == null || !state.init) {
+                stepAimPose(player, 1f, 1f / 20f);
+                state = aimSmooth.get(id);
+            }
+            if (state == null) {
+                continue;
+            }
+            player.prevRenderYawOffset = state.bodyYaw;
+            player.renderYawOffset = state.bodyYaw;
+            player.prevRotationYawHead = state.lookYaw;
+            player.rotationYawHead = state.lookYaw;
+        }
+        syncLocalAimPoseToServer();
+    }
+
+    private void syncLocalAimPoseToServer() {
+        EntityPlayerSP player = mc.player;
+        if (player == null || mc.world == null) {
+            lastSentAimPoseActive = false;
+            return;
+        }
+        UUID id = player.getUniqueID();
+        if (!isThirdPersonAiming(id)) {
+            if (lastSentAimPoseActive) {
+                ModularWarfare.NETWORK.sendToServer(new PacketAimPoseSync(0f, 0f, 0f, false));
+                lastSentAimPoseActive = false;
+            }
+            return;
+        }
+        ShoulderAimCorrect.AimLook pose = ShoulderAimCorrect.resolve(player, 1f);
+        ModularWarfare.NETWORK.sendToServer(
+            new PacketAimPoseSync(pose.lookYaw, pose.lookPitch, pose.bodyYaw, true)
+        );
+        lastSentAimPoseActive = true;
+    }
+
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
+    void onRender(RenderPlayerEvent.Pre event) {
+        EntityPlayer player = event.getEntityPlayer();
+        UUID id = player.getUniqueID();
+        if (!isThirdPersonAiming(id)) {
+            aimSmooth.remove(id);
+            return;
+        }
+        float partialTicks = event.getPartialRenderTick();
+        ShoulderAimCorrect.AimLook smoothed = stepAimPose(player, partialTicks, aimBodyFrameDt);
+        player.prevRenderYawOffset = smoothed.bodyYaw;
+        player.renderYawOffset = smoothed.bodyYaw;
+        aimPitchBackup.put(id, new float[] { player.prevRotationPitch, player.rotationPitch });
+        player.prevRotationPitch = smoothed.lookPitch;
+        player.rotationPitch = smoothed.lookPitch;
+        player.prevRotationYawHead = smoothed.lookYaw;
+        player.rotationYawHead = smoothed.lookYaw;
+    }
+
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    void onRenderAimPoseRestore(RenderPlayerEvent.Post event) {
+        UUID id = event.getEntityPlayer().getUniqueID();
+        float[] backup = aimPitchBackup.remove(id);
+        if (backup != null) {
+            EntityPlayer player = event.getEntityPlayer();
+            player.prevRotationPitch = backup[0];
+            player.rotationPitch = backup[1];
+        }
+    }
+
+    /** Non-ELM ride aim: torso + arms follow look twist (call after Vehicle handlebars). */
+    public static void applyRideUpperBodyTwist(ModelBiped biped, Entity entityIn) {
+        if (biped == null || !(entityIn instanceof EntityPlayer)) {
+            return;
+        }
+        EntityPlayer player = (EntityPlayer) entityIn;
+        if (!player.isRiding() || !isThirdPersonAiming(player.getUniqueID())) {
+            return;
+        }
+        if (isClientElmPlayer(player.getUniqueID())) {
+            return;
+        }
+        SmoothAimPose state = aimSmooth.get(player.getUniqueID());
+        if (state == null || !state.init) {
+            return;
+        }
+        float twistRad = state.upperBodyTwistDeg * ((float) Math.PI / 180f);
+        float headPitch = biped.bipedHead.rotateAngleX;
+
+        float armYRight = biped.bipedRightArm.rotationPointY;
+        float armYLeft = biped.bipedLeftArm.rotationPointY;
+        if (armYRight < 1.0F || armYRight > 4.0F) {
+            armYRight = 2.0F;
+        }
+        if (armYLeft < 1.0F || armYLeft > 4.0F) {
+            armYLeft = 2.0F;
+        }
+        biped.bipedRightArm.offsetX = 0F;
+        biped.bipedRightArm.offsetY = 0F;
+        biped.bipedRightArm.offsetZ = 0F;
+        biped.bipedLeftArm.offsetX = 0F;
+        biped.bipedLeftArm.offsetY = 0F;
+        biped.bipedLeftArm.offsetZ = 0F;
+        biped.bipedRightArm.setRotationPoint(-5.0F, armYRight, 0.0F);
+        biped.bipedLeftArm.setRotationPoint(5.0F, armYLeft, 0.0F);
+
+        biped.bipedBody.rotateAngleY = twistRad;
+        biped.bipedHead.rotateAngleY = twistRad;
+        biped.bipedHeadwear.rotateAngleY = twistRad;
+
+        orbitPivotAroundBodyY(biped.bipedRightArm, biped.bipedBody, -twistRad);
+        orbitPivotAroundBodyY(biped.bipedLeftArm, biped.bipedBody, -twistRad);
+
+        biped.bipedRightArm.rotateAngleY = twistRad - 0.1F;
+        biped.bipedLeftArm.rotateAngleY = twistRad + 0.1F + 0.4F;
+        biped.bipedRightArm.rotateAngleX = -((float) Math.PI / 2F) + headPitch;
+        biped.bipedLeftArm.rotateAngleX = -((float) Math.PI / 2F) + headPitch;
+        biped.bipedRightArm.rotateAngleZ = 0F;
+        biped.bipedLeftArm.rotateAngleZ = 0F;
+
+        if (biped instanceof ModelPlayer) {
+            ModelPlayer mp = (ModelPlayer) biped;
+            mp.bipedBodyWear.rotateAngleY = biped.bipedBody.rotateAngleY;
+            mp.bipedRightArmwear.rotateAngleX = biped.bipedRightArm.rotateAngleX;
+            mp.bipedRightArmwear.rotateAngleY = biped.bipedRightArm.rotateAngleY;
+            mp.bipedRightArmwear.rotateAngleZ = 0F;
+            mp.bipedLeftArmwear.rotateAngleX = biped.bipedLeftArm.rotateAngleX;
+            mp.bipedLeftArmwear.rotateAngleY = biped.bipedLeftArm.rotateAngleY;
+            mp.bipedLeftArmwear.rotateAngleZ = 0F;
+            mp.bipedRightArmwear.offsetX = 0F;
+            mp.bipedRightArmwear.offsetY = 0F;
+            mp.bipedRightArmwear.offsetZ = 0F;
+            mp.bipedLeftArmwear.offsetX = 0F;
+            mp.bipedLeftArmwear.offsetY = 0F;
+            mp.bipedLeftArmwear.offsetZ = 0F;
+            mp.bipedRightArmwear.setRotationPoint(-5.0F, armYRight, 0.0F);
+            mp.bipedLeftArmwear.setRotationPoint(5.0F, armYLeft, 0.0F);
+            orbitPivotAroundBodyY(mp.bipedRightArmwear, biped.bipedBody, -twistRad);
+            orbitPivotAroundBodyY(mp.bipedLeftArmwear, biped.bipedBody, -twistRad);
+        }
+    }
+
+    /** Orbit a sibling ModelRenderer pivot around {@code body} on Y. */
+    private static void orbitPivotAroundBodyY(ModelRenderer part, ModelRenderer body, float yaw) {
+        float cos = MathHelper.cos(yaw);
+        float sin = MathHelper.sin(yaw);
+        float dx = part.rotationPointX - body.rotationPointX;
+        float dy = part.rotationPointY - body.rotationPointY;
+        float dz = part.rotationPointZ - body.rotationPointZ;
+        part.rotationPointX = body.rotationPointX + dx * cos - dz * sin;
+        part.rotationPointY = body.rotationPointY + dy;
+        part.rotationPointZ = body.rotationPointZ + dx * sin + dz * cos;
+    }
+
+    private static boolean isClientElmPlayer(UUID id) {
+        if (id == null) {
+            return false;
+        }
+        try {
+            return mchhui.he.api.ClientELMAPI.isELM(id);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Current eased aim look (ELM bone SET / TP pose). */
+    public static ShoulderAimCorrect.AimLook getAimLook(EntityPlayer player, float partialTicks) {
+        UUID id = player.getUniqueID();
+        SmoothAimPose state = aimSmooth.get(id);
+        if (state != null && state.init && state.steppedStamp == aimSmoothRenderStamp) {
+            return new ShoulderAimCorrect.AimLook(state.lookYaw, state.lookPitch, state.bodyYaw, true,
+                state.upperBodyTwistDeg);
+        }
+        return stepAimPose(player, partialTicks, aimBodyFrameDt);
+    }
+
+    /**
+     * Ease look/body toward target; settle ≈ {@code aimBodySettleSeconds}, {@code 0} = snap.
+     */
+    private static ShoulderAimCorrect.AimLook stepAimPose(EntityPlayer player, float partialTicks, float dtSeconds) {
+        ShoulderAimCorrect.AimLook target = ShoulderAimCorrect.resolve(player, partialTicks);
+        UUID id = player.getUniqueID();
+        SmoothAimPose state = aimSmooth.get(id);
+        if (state == null) {
+            state = new SmoothAimPose();
+            aimSmooth.put(id, state);
+        }
+        float settle = aimBodySettleSeconds();
+        if (!state.init || settle <= 1e-4f) {
+            state.lookYaw = target.lookYaw;
+            state.lookPitch = target.lookPitch;
+            state.bodyYaw = target.bodyYaw;
+            state.upperBodyTwistDeg = MathHelper.wrapDegrees(state.lookYaw - state.bodyYaw);
+            state.init = true;
+            state.steppedStamp = aimSmoothRenderStamp;
+            return new ShoulderAimCorrect.AimLook(state.lookYaw, state.lookPitch, state.bodyYaw,
+                target.bodyFollowsLook, state.upperBodyTwistDeg);
+        }
+        float dt = dtSeconds;
+        if (dt < 0.001f) {
+            dt = 0.001f;
+        } else if (dt > 0.05f) {
+            dt = 0.05f;
+        }
+        float alpha = 1f - (float) Math.exp(-3.0 * dt / settle);
+        if (alpha < 0f) {
+            alpha = 0f;
+        } else if (alpha > 1f) {
+            alpha = 1f;
+        }
+        state.lookYaw = state.lookYaw + MathHelper.wrapDegrees(target.lookYaw - state.lookYaw) * alpha;
+        state.bodyYaw = state.bodyYaw + MathHelper.wrapDegrees(target.bodyYaw - state.bodyYaw) * alpha;
+        state.upperBodyTwistDeg = MathHelper.wrapDegrees(state.lookYaw - state.bodyYaw);
+        float pitchDelta = target.lookPitch - state.lookPitch;
+        state.lookPitch = state.lookPitch + pitchDelta * alpha;
+        if (state.lookPitch < -90f) {
+            state.lookPitch = -90f;
+        } else if (state.lookPitch > 90f) {
+            state.lookPitch = 90f;
+        }
+        state.steppedStamp = aimSmoothRenderStamp;
+        return new ShoulderAimCorrect.AimLook(state.lookYaw, state.lookPitch, state.bodyYaw,
+            target.bodyFollowsLook, state.upperBodyTwistDeg);
+    }
+
+    private static float aimBodySettleSeconds() {
+        if (ModConfig.INSTANCE != null && ModConfig.INSTANCE.client != null
+            && ModConfig.INSTANCE.client.aimBodySettleSeconds != null) {
+            return ModConfig.INSTANCE.client.aimBodySettleSeconds.floatValue();
+        }
+        return 0.5f;
     }
 
     @SubscribeEvent
@@ -452,8 +723,6 @@ public class ClientRenderHooks {
                             ClientProxy.scopeUtils.initBlur();  
                         }
                         OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, OptifineHelper.getDrawFrameBuffer());
-                        // OptiFine / scope FBO steal drops Hand MRT drawBuffers — restore fill only
-                        // (do not rebind a stale held-item albedo before the item renderer runs).
                         if (AtomicShaderCompat.isGBufferFillActive()) {
                             AtomicShaderCompat.rebindFillIfActive();
                         }
@@ -574,9 +843,6 @@ public class ClientRenderHooks {
             renderHeldItem(stack, hand, partialTicksTime, fov);
             cloud.siz.atomic.api.render.AtomicGBufferCompat.finishOffscreenHandDeferred(ScopeUtils.INSIDE_GUN_TEX);
             OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, OptifineHelper.getDrawFrameBuffer());
-            // Drop nested-pass albedo pointer; main FP renderItem will bind skin/gun fresh.
-            // Do not rebindFillAndGunPbr here — that restored the inside-gun gun albedo onto TEX0
-            // before arms, and melee→sighted-gun left arms sampling wrong.
             AtomicShaderCompat.clearCurrentFillAlbedo();
             if (AtomicShaderCompat.isGBufferFillActive()) {
                 AtomicShaderCompat.rebindFillIfActive();
@@ -878,23 +1144,49 @@ public class ClientRenderHooks {
         if (AnimationUtils.isAiming.containsKey(playerId)) {
             return true;
         }
-        Minecraft mc = Minecraft.getMinecraft();
-        if (mc.player != null && mc.player.getUniqueID().equals(playerId)) {
-            ItemStack held = mc.player.getHeldItemMainhand();
-            if (held.getItem() instanceof ItemGun) {
-                ItemGun gun = (ItemGun) held.getItem();
-                if (GunType.getAttachment(held, AttachmentPresetEnum.Laser) != null && gun.getLaserEnabled(held)) {
-                    return true;
-                }
-                if (GunType.getAttachment(held, AttachmentPresetEnum.Flashlight) != null && gun.getFlashlightEnabled(held)) {
-                    return true;
-                }
-            }
+        EntityPlayer player = resolveClientPlayer(playerId);
+        if (player != null && isLaserOrFlashlightEnabledOnHeldGun(player.getHeldItemMainhand())) {
+            return true;
         }
         if (LaserRenderManager.getInstance().getLaserState(playerId)) {
             return true;
         }
         return FlashlightRenderManager.getInstance().getFlashlightState(playerId);
+    }
+
+    /** Local or world-tracked player by UUID (client thread). */
+    private static EntityPlayer resolveClientPlayer(java.util.UUID playerId) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc == null) {
+            return null;
+        }
+        if (mc.player != null && mc.player.getUniqueID().equals(playerId)) {
+            return mc.player;
+        }
+        if (mc.world != null) {
+            for (EntityPlayer p : mc.world.playerEntities) {
+                if (p != null && playerId.equals(p.getUniqueID())) {
+                    return p;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Gun NBT laser/flashlight flags when the matching attachment is present. */
+    private static boolean isLaserOrFlashlightEnabledOnHeldGun(ItemStack held) {
+        if (held == null || held.isEmpty() || !(held.getItem() instanceof ItemGun)) {
+            return false;
+        }
+        ItemGun gun = (ItemGun) held.getItem();
+        if (GunType.getAttachment(held, AttachmentPresetEnum.Laser) != null && gun.getLaserEnabled(held)) {
+            return true;
+        }
+        if (GunType.getAttachment(held, AttachmentPresetEnum.Flashlight) != null
+                && gun.getFlashlightEnabled(held)) {
+            return true;
+        }
+        return false;
     }
 
 }

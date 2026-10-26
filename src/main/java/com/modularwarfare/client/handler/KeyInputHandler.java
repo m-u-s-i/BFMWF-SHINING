@@ -102,6 +102,9 @@ public final class KeyInputHandler {
             EntityPlayerSP entityPlayer = Minecraft.getMinecraft().player;
             HandleKeyEvent event = new HandleKeyEvent(keyType);
             MinecraftForge.EVENT_BUS.post(event);
+            if (event.isCanceled()) {
+                return;
+            }
 
             switch (keyType) {
                 // F9 Reloads Models /// SHIFT + F9 Reloads Textures & Icons
@@ -109,6 +112,10 @@ public final class KeyInputHandler {
 
                     ModularWarfare.loadConfig();
                     ScriptHost.INSTANCE.reset();
+
+                    // Drop sticky FAILED loads so F9 can revive attachments that failed once
+                    // (transient GL/IO). clearAll is Shift+F9 only.
+                    mchhui.hegltf.GltfModelManager.get().clearFailedLoads();
 
                     if(ClientProxy.gunEnhancedRenderer != null) {
                         ClientProxy.gunEnhancedRenderer.resetModels();

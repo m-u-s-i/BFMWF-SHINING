@@ -70,6 +70,7 @@ import net.minecraft.client.renderer.entity.Render;
 import net.minecraft.client.renderer.entity.RenderLivingBase;
 import net.minecraft.client.renderer.entity.RenderManager;
 import net.minecraft.client.renderer.entity.RenderPlayer;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.init.Items;
 import net.minecraft.item.ItemStack;
@@ -211,11 +212,17 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         return start + (end - start) * alpha;
     }
 
+    private static final ResourceLocation LASER_ALBEDO =
+            new ResourceLocation(ModularWarfare.MOD_ID, "textures/skins/white.png");
+    private static DynamicTexture laserFillAlbedoTex;
+    private static ResourceLocation laserFillAlbedoLoc;
+    private static int laserFillAlbedoPacked = Integer.MIN_VALUE;
     public static final int BULLET_MAX_RENDER = 256;
     private static float theata90 = (float) Math.toRadians(90);
     public static final HashSet<String> DEFAULT_EXCEPT = new HashSet<String>();
     /** Scratch for merging same-MV gun part draws (selector/bullets/ammo). */
     private static final HashSet<String> GUN_PART_BATCH = new HashSet<String>();
+    private static final HashMap<String, HashSet<String>> THIRD_EXCEPT_CACHE = new HashMap<String, HashSet<String>>();
     public static final List<String> defaultHideList = Arrays.asList("ammoModel", "ammoModelPre", "ammoModelPost",
             "leftArmModel", "leftArmLayerModel",
             "leftArmSlimModel",
@@ -843,11 +850,10 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         GlStateManager.pushMatrix();
         GlStateManager.multMatrix(floatBuffer);
         
-        // Atomic Hand/Entity fill: one unified pass (do not split on OptiFine hand0/hand1).
+        // Atomic Hand/Entity fill: single pass.
         final boolean atomicFill = AtomicShaderCompat.isGBufferFillActive();
         final boolean atomicShadowOnly = AtomicShaderCompat.shouldDrawShadowDepthOnly();
         final boolean atomicCapture = atomicFill || atomicShadowOnly;
-        // Hand fill does NOT suppress blend (entity does). SrcA→clear(0) blackens soft alpha.
         if (atomicFill) {
             GlStateManager.disableBlend();
         } else {
@@ -931,7 +937,7 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
             exceptParts.addAll(DEFAULT_EXCEPT);
         }
         
-        HashSet<String> exceptPartsRendering=exceptParts;
+        HashSet<String> exceptPartsRendering=com.modularwarfare.api.ClientWeaponVisualAPI.applyPartVisibility(player, item, exceptParts);
         
         
         //model.updateAnimation(controller.getTime(),false);
@@ -945,10 +951,8 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
             blendTransform(model, item, !config.animations.containsKey(AnimationType.SPRINT), controller.getTime(),
                 controller.getSprintTime(), (float)controller.SPRINT, "sprint_righthand", applySprint, true, controller.getAimTime(), (float)controller.ADS, () -> {
                     if (isRenderHand0 && controller.ADS > 0) {
-                        String binding = "gunModel";
-                        if (config.attachment.containsKey(sightRendering.type.internalName)) {
-                            binding = config.attachment.get(sightRendering.type.internalName).binding;
-                        }
+                        String binding = GunEnhancedRenderConfig.resolveAttachmentBinding(config,
+                                AttachmentPresetEnum.Sight.typeName, sightRendering.type.internalName);
                         model.applyGlobalTransformToOther(binding, () -> {
                             renderAttachment(config, AttachmentPresetEnum.Sight.typeName,
                                 sightRendering.type.internalName, item, () -> {
@@ -1477,10 +1481,8 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                         }
                         
                         if (attachmentModel != null) {
-                            String binding = "gunModel";
-                            if (config.attachment.containsKey(attachmentType.internalName)) {
-                                binding = config.attachment.get(attachmentType.internalName).binding;
-                            }
+                            String binding = GunEnhancedRenderConfig.resolveAttachmentBinding(config,
+                                    attachment.typeName, attachmentType.internalName);
                             final String sightBinding = binding;
                             final String attTexDir;
                             final String attTexPath;
@@ -1772,7 +1774,6 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
          * 但是出于现状考虑 暂时设在isRenderHand0渲染
          * 需要处理深度遮蔽 可以延迟渲染
          * 就像镜面渲染一样 MC的手部半透明一坨大便 只好延迟到hud渲染
-         * Atomic Hand MRT: soft smoke/eject uses SrcA — after finishHandDeferred fill is off.
         */
         if (isRenderHand0 && !atomicShadowOnly && !AtomicShaderCompat.isGBufferFillActive()) {
             if (config.specialEffect.postSmokeGroups != null) {
@@ -1884,11 +1885,15 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         GlStateManager.tryBlendFuncSeparate(SourceFactor.SRC_ALPHA, DestFactor.ONE_MINUS_SRC_ALPHA, SourceFactor.ONE, DestFactor.ZERO);
         GlStateManager.disableBlend();
 
-        // Restore TEX0 so post-hand fire / particles do not inherit TEX2–TEX5 or dirty filters.
+        // Restore TEX0 active + filter after multi-unit binds.
         com.modularwarfare.client.compat.TextureSamplingRegistry.restoreDefaultTexUnit();
         if (bindingTexture != null) {
             com.modularwarfare.client.compat.TextureSamplingRegistry.restoreAlbedoSampling(bindingTexture);
         }
+        // Reset TEX0 texture matrix after lightmap.
+        GlStateManager.matrixMode(GL11.GL_TEXTURE);
+        GlStateManager.loadIdentity();
+        GlStateManager.matrixMode(GL11.GL_MODELVIEW);
 
         if (type == CustomItemRenderType.EQUIPPED_FIRST_PERSON
                 && Minecraft.getMinecraft().gameSettings.thirdPersonView == 0) {
@@ -1898,48 +1903,65 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
 
     private void renderLaserModel(AttachmentRenderConfig.Laser laserConfig, ModelAttachment attachmentModel, float bx, float by, float worldScale, AnimationType currentAction, boolean laserEnabled) {
         GlStateManager.pushMatrix();
+        final boolean atomicFill = AtomicShaderCompat.isGBufferFillActive()
+                && !AtomicShaderCompat.isShadowDepthActive();
+        final ResourceLocation prevFillAlbedo = atomicFill ? AtomicShaderCompat.getCurrentFillAlbedo() : null;
         try {
-            GlStateManager.enableBlend();
             GlStateManager.depthMask(false);
             GlStateManager.disableLighting();
-            
-            OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, 240f, 240f);
-            
-            GlStateManager.tryBlendFuncSeparate(
-                SourceFactor.SRC_ALPHA, 
-                DestFactor.ONE,  
-                SourceFactor.ONE, 
-                DestFactor.ZERO
-            );
 
-            GlStateManager.disableLighting();
-            ObjModelRenderer.glowTxtureMode = true;
-            
-            bindTexture(new ResourceLocation(ModularWarfare.MOD_ID, "textures/skins/white.png"));
-            
-            float brightness = 1.2f; 
-            GlStateManager.color(
-                Math.min(laserConfig.laserColor[0] * brightness, 1.0f),
-                Math.min(laserConfig.laserColor[1] * brightness, 1.0f),
-                Math.min(laserConfig.laserColor[2] * brightness, 1.0f),
-                laserConfig.laserAlpha
-            );
-            
-            attachmentModel.renderPart("laserModel", worldScale);
+            float brightness = 1.2f;
+            float lr = Math.min(laserConfig.laserColor[0] * brightness, 1.0f);
+            float lg = Math.min(laserConfig.laserColor[1] * brightness, 1.0f);
+            float lb = Math.min(laserConfig.laserColor[2] * brightness, 1.0f);
+            float la = laserConfig.laserAlpha;
+
+            if (atomicFill) {
+                // Fill MRT cannot additive-blend. white.png * glColor fails on VAO fills
+                // (gl_Color attrib 3 defaults to 1,1,1,1) → pure white emissive.
+                GlStateManager.disableBlend();
+                GlStateManager.enableAlpha();
+                GlStateManager.alphaFunc(GL11.GL_GREATER, 0.1F);
+                ObjModelRenderer.glowTxtureMode = false;
+                bindLaserColorFillAlbedo(lr, lg, lb);
+                AtomicShaderCompat.beginMeshFlatEmissive(lr, lg, lb, la);
+            } else {
+                GlStateManager.enableBlend();
+                OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, 240f, 240f);
+                GlStateManager.tryBlendFuncSeparate(
+                    SourceFactor.SRC_ALPHA,
+                    DestFactor.ONE,
+                    SourceFactor.ONE,
+                    DestFactor.ZERO
+                );
+                ObjModelRenderer.glowTxtureMode = true;
+                bindTexture(LASER_ALBEDO);
+            }
+
+            GlStateManager.color(lr, lg, lb, la);
+
+            attachmentModel.renderLaser(worldScale);
 
             GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
             GlStateManager.depthMask(true);
             GlStateManager.enableLighting();
-            GlStateManager.tryBlendFuncSeparate(
-                SourceFactor.SRC_ALPHA, 
-                DestFactor.ONE_MINUS_SRC_ALPHA,
-                SourceFactor.ONE, 
-                DestFactor.ZERO
-            );
+            if (!atomicFill) {
+                GlStateManager.tryBlendFuncSeparate(
+                    SourceFactor.SRC_ALPHA,
+                    DestFactor.ONE_MINUS_SRC_ALPHA,
+                    SourceFactor.ONE,
+                    DestFactor.ZERO
+                );
+                OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, bx, by);
+            }
             ObjModelRenderer.glowTxtureMode = false;
-            OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, bx, by);
-            
         } finally {
+            if (atomicFill) {
+                AtomicShaderCompat.endMeshFlatEmissive();
+                if (prevFillAlbedo != null) {
+                    AtomicShaderCompat.bindFillAlbedo(prevFillAlbedo);
+                }
+            }
             GlStateManager.popMatrix();
         }
 
@@ -1957,6 +1979,25 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                 currentAction
             );
         }
+    }
+
+    /** 1x1 albedo so fill lighting uses laser RGB even when vertex color is ignored. */
+    private static void bindLaserColorFillAlbedo(float r, float g, float b) {
+        int ir = Math.min(255, Math.max(0, (int) (r * 255f + 0.5f)));
+        int ig = Math.min(255, Math.max(0, (int) (g * 255f + 0.5f)));
+        int ib = Math.min(255, Math.max(0, (int) (b * 255f + 0.5f)));
+        int packed = (ir << 16) | (ig << 8) | ib;
+        if (laserFillAlbedoTex == null) {
+            laserFillAlbedoTex = new DynamicTexture(1, 1);
+            laserFillAlbedoLoc = Minecraft.getMinecraft().getTextureManager()
+                    .getDynamicTextureLocation("mwf_laser_fill_albedo", laserFillAlbedoTex);
+        }
+        if (packed != laserFillAlbedoPacked) {
+            laserFillAlbedoTex.getTextureData()[0] = 0xFF000000 | packed;
+            laserFillAlbedoTex.updateDynamicTexture();
+            laserFillAlbedoPacked = packed;
+        }
+        AtomicShaderCompat.bindFillAlbedo(laserFillAlbedoLoc);
     }
 
     
@@ -2150,82 +2191,85 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         drawThirdGun(renderPlayer, renderType, player, demoStack, false);
     }
 
-    @SideOnly(Side.CLIENT)
-    private void applyThirdPersonGunAnimSync(ModelEnhancedGun model, EntityLivingBase holder) {
-        if (model == null || holder == null) {
-            return;
-        }
-        GunEnhancedRenderConfig config = (GunEnhancedRenderConfig) model.config;
-        AnimationController controller = AnimationController.getController(holder, config);
-        if (controller.getPlayingAnimation() == AnimationType.DEFAULT
-                || controller.getPlayingAnimation() == AnimationType.PRE_FIRE
-                || controller.getPlayingAnimation() == AnimationType.FIRE
-                || controller.getPlayingAnimation() == AnimationType.POST_FIRE) {
-            model.updateAnimation(controller.getTime(), true);
-        } else {
-            model.updateAnimation((float) config.animations.get(AnimationType.DEFAULT).getStartTime(config.FPS), true);
-        }
+    /** 3P 定姿：不跟动画机，仅 DEFAULT/DEFAULT_EMPTY 静态 pose（HEBridge 直接调）。 */
+    public void drawThirdGunSimple(RenderLivingBase renderPlayer, RenderType renderType, EntityLivingBase player,
+            ItemStack demoStack) {
+        drawThirdGunSimple(renderPlayer, renderType, player, demoStack, false);
     }
 
-    public void drawThirdGun(RenderLivingBase renderPlayer, RenderType renderType, EntityLivingBase player,
+    public void drawThirdGunSimple(RenderLivingBase renderPlayer, RenderType renderType, EntityLivingBase player,
             ItemStack demoStack, boolean sneakFlag) {
-        if (!(demoStack.getItem() instanceof ItemGun))
-            return;
-        GunType gunType = ((ItemGun) demoStack.getItem()).type;
-        if (gunType == null) {
-            return;
-        }
-        if (AtomicShaderCompat.shouldSkipLegacyColorDraw()) {
-            return;
-        }
-        final boolean atomicFill = AtomicShaderCompat.isGBufferFillActive();
-        final boolean atomicShadowOnly = AtomicShaderCompat.shouldDrawShadowDepthOnly();
-        ModelEnhancedGun model;
-            if (renderType == RenderType.ITEMFRAME || renderType == RenderType.ITEMLOOT) {
-                String key = renderType.serializedName;
-                if(!thirdPersonModels.containsKey(key) || thirdPersonModels.get(key).baseType != gunType) {
-                    ModelEnhancedGun newModel = new ModelEnhancedGun((GunEnhancedRenderConfig)gunType.enhancedModel.config, gunType);
-                    newModel.model = gunType.enhancedModel.model;
-                    thirdPersonModels.put(key, newModel);
-                }
-                model = (ModelEnhancedGun)thirdPersonModels.get(key);
-            } else {
-                model = getOrCreateModel(gunType, false, player != null ? player.getUniqueID() : null);
-            }
-        if (model == null || !model.isAnimReady() || model.model == null || model.model.geoModel == null) {
-            return;
-        }
-        GunEnhancedRenderConfig config = (GunEnhancedRenderConfig) model.config;
-        EnhancedStateMachine anim = ClientRenderHooks.getEnhancedAnimMachine(player);
-        if (player != null) {
-            applyThirdPersonGunAnimSync(model, player);
-        } else {
-            model.updateAnimation((float) config.animations.get(AnimationType.DEFAULT).getStartTime(config.FPS), true);
-        }
+        drawThirdGun(renderPlayer, renderType, player, demoStack, sneakFlag, true);
+    }
 
+    public static float resolveThirdIdleTime(GunEnhancedRenderConfig config, ItemStack stack) {
+        if (config == null || config.animations == null || config.animations.isEmpty()) {
+            return 0f;
+        }
+        AnimationType type = AnimationType.DEFAULT;
+        if (stack != null && !ItemGun.hasNextShot(stack)
+                && config.animations.containsKey(AnimationType.DEFAULT_EMPTY)) {
+            type = AnimationType.DEFAULT_EMPTY;
+        }
+        if (!config.animations.containsKey(type)) {
+            type = AnimationType.DEFAULT;
+        }
+        EnhancedRenderConfig.Animation anim = config.animations.get(type);
+        if (anim == null) {
+            return 0f;
+        }
+        return (float) anim.getStartTime(config.FPS);
+    }
+
+    private static String buildThirdExceptCacheKey(GunType gunType, RenderType renderType, ItemStack demoStack) {
+        StringBuilder sb = new StringBuilder(96);
+        sb.append(gunType.internalName).append('|').append(renderType.serializedName);
+        for (AttachmentPresetEnum attachment : AttachmentPresetEnum.values()) {
+            ItemStack itemStack = GunType.getAttachment(demoStack, attachment);
+            if (itemStack != null && itemStack.getItem() != Items.AIR && itemStack.getItem() instanceof ItemAttachment) {
+                sb.append('|').append(attachment.typeName).append('=')
+                        .append(((ItemAttachment) itemStack.getItem()).type.internalName);
+            }
+        }
+        if (demoStack.hasTagCompound()) {
+            ItemStack loadedAmmo = new ItemStack(demoStack.getTagCompound().getCompoundTag("ammo"));
+            if (loadedAmmo.getItem() instanceof ItemAmmo) {
+                sb.append("|ammo=").append(((ItemAmmo) loadedAmmo.getItem()).type.internalName);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static HashSet<String> buildThirdExceptParts(GunEnhancedRenderConfig config, RenderType renderType,
+            ItemStack demoStack) {
         HashSet<String> exceptParts = new HashSet<String>();
-        if (config.specialEffect.flashModelGroups != null) {
+        if (config.specialEffect != null && config.specialEffect.flashModelGroups != null) {
             config.specialEffect.flashModelGroups.forEach((g) -> {
                 exceptParts.add(g.name);
             });
         }
-        exceptParts.addAll(config.defaultHidePart);
-        if (renderType == RenderType.PLAYER_OFFHAND) {
-            exceptParts.addAll(config.thirdHideOffhandPart);
-            exceptParts.removeAll(config.thirdShowOffhandPart);
-        } else {
-            exceptParts.addAll(config.thirdHidePart);
-            exceptParts.removeAll(config.thirdShowPart);
+        if (config.defaultHidePart != null) {
+            exceptParts.addAll(config.defaultHidePart);
         }
-        // exceptParts.addAll(DEFAULT_EXCEPT);
-
-        boolean glowTxtureMode = ObjModelRenderer.glowTxtureMode;
-        ObjModelRenderer.glowTxtureMode = true;
+        if (renderType == RenderType.PLAYER_OFFHAND) {
+            if (config.thirdHideOffhandPart != null) {
+                exceptParts.addAll(config.thirdHideOffhandPart);
+            }
+            if (config.thirdShowOffhandPart != null) {
+                exceptParts.removeAll(config.thirdShowOffhandPart);
+            }
+        } else {
+            if (config.thirdHidePart != null) {
+                exceptParts.addAll(config.thirdHidePart);
+            }
+            if (config.thirdShowPart != null) {
+                exceptParts.removeAll(config.thirdShowPart);
+            }
+        }
         for (AttachmentPresetEnum attachment : AttachmentPresetEnum.values()) {
             ItemStack itemStack = GunType.getAttachment(demoStack, attachment);
             if (itemStack != null && itemStack.getItem() != Items.AIR) {
                 AttachmentType attachmentType = ((ItemAttachment) itemStack.getItem()).type;
-                String binding = "gunModel";
                 if (config.attachmentGroup.containsKey(attachment.typeName)) {
                     if (config.attachmentGroup.get(attachment.typeName).hidePart != null) {
                         exceptParts.addAll(config.attachmentGroup.get(attachment.typeName).hidePart);
@@ -2238,12 +2282,10 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                 }
             }
         }
-
         for (AttachmentPresetEnum attachment : AttachmentPresetEnum.values()) {
             ItemStack itemStack = GunType.getAttachment(demoStack, attachment);
             if (itemStack != null && itemStack.getItem() != Items.AIR) {
                 AttachmentType attachmentType = ((ItemAttachment) itemStack.getItem()).type;
-                String binding = "gunModel";
                 if (config.attachmentGroup.containsKey(attachment.typeName)) {
                     if (config.attachmentGroup.get(attachment.typeName).showPart != null) {
                         exceptParts.removeAll(config.attachmentGroup.get(attachment.typeName).showPart);
@@ -2256,7 +2298,6 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                 }
             }
         }
-
         if (demoStack.hasTagCompound()) {
             ItemStack loadedAmmo = new ItemStack(demoStack.getTagCompound().getCompoundTag("ammo"));
             if (loadedAmmo.getItem() instanceof ItemAmmo) {
@@ -2272,8 +2313,103 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                 }
             }
         }
-
         exceptParts.addAll(RenderGunEnhanced.DEFAULT_EXCEPT);
+        return exceptParts;
+    }
+
+    /** Cached except set for third-person; do not mutate the returned set. */
+    private static HashSet<String> getCachedThirdExceptParts(GunType gunType, GunEnhancedRenderConfig config,
+            RenderType renderType, ItemStack demoStack) {
+        String key = buildThirdExceptCacheKey(gunType, renderType, demoStack);
+        HashSet<String> cached = THIRD_EXCEPT_CACHE.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        HashSet<String> built = buildThirdExceptParts(config, renderType, demoStack);
+        THIRD_EXCEPT_CACHE.put(key, built);
+        return built;
+    }
+
+    @SideOnly(Side.CLIENT)
+    private void applyThirdPersonGunAnimSync(ModelEnhancedGun model, EntityLivingBase holder) {
+        if (model == null || holder == null) {
+            return;
+        }
+        GunEnhancedRenderConfig config = (GunEnhancedRenderConfig) model.config;
+        AnimationController controller = AnimationController.getController(holder, config);
+        if (controller.getPlayingAnimation() == AnimationType.CUSTOM
+                || controller.getPlayingAnimation() == AnimationType.DEFAULT
+                || controller.getPlayingAnimation() == AnimationType.DEFAULT_EMPTY
+                || controller.getPlayingAnimation() == AnimationType.PRE_FIRE
+                || controller.getPlayingAnimation() == AnimationType.FIRE
+                || controller.getPlayingAnimation() == AnimationType.POST_FIRE) {
+            model.updateAnimation(controller.getTime(), true);
+        } else {
+            model.updateAnimation(resolveThirdIdleTime(config, holder.getHeldItemMainhand()), true);
+        }
+    }
+
+    @SideOnly(Side.CLIENT)
+    private void applyThirdIdleCached(ModelEnhancedGun model, GunEnhancedRenderConfig config,
+            ItemStack demoStack) {
+        float time = resolveThirdIdleTime(config, demoStack);
+        model.ensureThirdIdleCached(time);
+    }
+
+    public void drawThirdGun(RenderLivingBase renderPlayer, RenderType renderType, EntityLivingBase player,
+            ItemStack demoStack, boolean sneakFlag) {
+        drawThirdGun(renderPlayer, renderType, player, demoStack, sneakFlag, false);
+    }
+
+    private void drawThirdGun(RenderLivingBase renderPlayer, RenderType renderType, EntityLivingBase player,
+            ItemStack demoStack, boolean sneakFlag, boolean frozenIdle) {
+        if (!(demoStack.getItem() instanceof ItemGun))
+            return;
+        GunType gunType = ((ItemGun) demoStack.getItem()).type;
+        if (gunType == null) {
+            return;
+        }
+        if (AtomicShaderCompat.shouldSkipLegacyColorDraw()) {
+            return;
+        }
+        final boolean atomicFill = AtomicShaderCompat.isGBufferFillActive();
+        final boolean atomicShadowOnly = AtomicShaderCompat.shouldDrawShadowDepthOnly();
+        ModelEnhancedGun model;
+        if (frozenIdle) {
+            model = getOrCreateSimpleThirdModel(gunType);
+        } else if (renderType == RenderType.ITEMFRAME || renderType == RenderType.ITEMLOOT) {
+            String key = renderType.serializedName;
+            if (!thirdPersonModels.containsKey(key) || thirdPersonModels.get(key).baseType != gunType) {
+                ModelEnhancedGun newModel = new ModelEnhancedGun((GunEnhancedRenderConfig) gunType.enhancedModel.config,
+                        gunType);
+                newModel.model = gunType.enhancedModel.model;
+                thirdPersonModels.put(key, newModel);
+            }
+            model = (ModelEnhancedGun) thirdPersonModels.get(key);
+        } else {
+            model = getOrCreateModel(gunType, false, player != null ? player.getUniqueID() : null);
+        }
+        if (model == null || !model.isAnimReady() || model.model == null || model.model.geoModel == null) {
+            return;
+        }
+        GunEnhancedRenderConfig config = (GunEnhancedRenderConfig) model.config;
+        // Simple: frozen DEFAULT/DEFAULT_EMPTY pose+skin cache — never touch AnimationController / fire playback.
+        final EnhancedStateMachine anim = frozenIdle ? null
+                : ClientRenderHooks.getEnhancedAnimMachine(player);
+        if (frozenIdle) {
+            applyThirdIdleCached(model, config, demoStack);
+        } else if (player != null) {
+            applyThirdPersonGunAnimSync(model, player);
+        } else {
+            model.updateAnimation(resolveThirdIdleTime(config, demoStack), true);
+        }
+
+        HashSet<String> exceptParts = com.modularwarfare.api.ClientWeaponVisualAPI.applyPartVisibility(player, demoStack,
+                getCachedThirdExceptParts(gunType, config, renderType, demoStack));
+
+        boolean glowTxtureMode = ObjModelRenderer.glowTxtureMode;
+        ObjModelRenderer.glowTxtureMode = true;
+        // Attachment hide/show already folded into exceptParts cache.
 
         float worldScale = 1;
         HashSet<String> exceptPartsRendering = exceptParts;
@@ -2510,10 +2646,8 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
                     }
                 }
                 if (attachmentModel != null) {
-                    String binding = "gunModel";
-                    if (config.attachment.containsKey(attachmentType.internalName)) {
-                        binding = config.attachment.get(attachmentType.internalName).binding;
-                    }
+                    String binding = GunEnhancedRenderConfig.resolveAttachmentBinding(config,
+                            attachment.typeName, attachmentType.internalName);
                     model.applyGlobalTransformToOther(binding, () -> {
                         if (attachmentType.sameTextureAsGun) {
                             ClientProxy.gunEnhancedRenderer.bindTexture("guns", gunPath);
@@ -2599,7 +2733,7 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         } else {
             OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, 240, 240);
         }
-        if (shouldRenderFlash && anim.shooting && anim.getShootingAnimationType().showFlashModel()
+        if (shouldRenderFlash && anim != null && anim.shooting && anim.getShootingAnimationType().showFlashModel()
                 && player != null && !player.isInWater()) {
             GlStateManager.pushMatrix();
             applyFlashModelRootOffset(model, config, demoStack);
@@ -2693,6 +2827,16 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         TextureSamplingRegistry.restoreDefaultTexUnit();
         if (bindingTexture != null) {
             TextureSamplingRegistry.restoreAlbedoSampling(bindingTexture);
+        }
+        // TP skinned guns leave gun albedo / emissive / discard residue that breaks HE WorldObject
+        // draws later in the same ENTITIES ExternalDraw pass — scrub before returning.
+        if (atomicFill) {
+            AtomicShaderCompat.clearEmissive();
+            AtomicShaderCompat.clearCurrentFillAlbedo();
+            AtomicShaderCompat.markFillCaptureDirty();
+            AtomicShaderCompat.rebindFillIfActive();
+            org.lwjgl.opengl.GL11.glDisable(org.lwjgl.opengl.GL30.GL_RASTERIZER_DISCARD);
+            org.lwjgl.opengl.GL30.glBindVertexArray(0);
         }
     }
 
@@ -3651,15 +3795,8 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         if (attModel == null || !attModel.isGltf() || !attModel.existPart(ref.nodeName)) {
             return;
         }
-        String binding = "gunModel";
-        if (config.attachment != null && attType.internalName != null
-                && config.attachment.containsKey(attType.internalName)
-                && config.attachment.get(attType.internalName) != null
-                && config.attachment.get(attType.internalName).binding != null
-                && !config.attachment.get(attType.internalName).binding.isEmpty()) {
-            binding = config.attachment.get(attType.internalName).binding;
-        }
-        final String bindingFinal = binding;
+        final String bindingFinal = GunEnhancedRenderConfig.resolveAttachmentBinding(config,
+                ref.slot.typeName, attType.internalName);
         model.applyGlobalTransformToOther(bindingFinal, () -> {
             renderAttachment(config, ref.slot.typeName, attType.internalName, gunStack, () -> {
                 attModel.applyGlobalTransformToOther(ref.nodeName, sample);
@@ -4008,10 +4145,7 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
         if (!attModel.isGltf() || !attModel.existPart(nodeName)) {
             return null;
         }
-        String binding = "gunModel";
-        if (config.attachment.containsKey(attType.internalName)) {
-            binding = config.attachment.get(attType.internalName).binding;
-        }
+        String binding = GunEnhancedRenderConfig.resolveAttachmentBinding(config, slot.typeName, attType.internalName);
         Matrix4f mat = new Matrix4f(gunModel.getGlobalTransform(binding));
         String handguardName = null;
         ItemStack hg = GunType.getAttachment(gunStack, AttachmentPresetEnum.Handguard);
@@ -4159,7 +4293,6 @@ public class RenderGunEnhanced extends CustomItemRendererEnhanced {
     }
 
     public void bindPlayerSkin() {
-        // Skin-ready fallback avoids MISSING purple (MWF); Atomic PBR only when pipeline on.
         bindingTexture = AtomicShaderCompat.resolveReadyPlayerSkin(Minecraft.getMinecraft().player);
         AtomicShaderCompat.bindFillAlbedo(bindingTexture);
     }

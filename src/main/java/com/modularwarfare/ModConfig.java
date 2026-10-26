@@ -67,6 +67,11 @@ public class ModConfig {
         public boolean gunSmokeCorrectForIterationT=false;
         public boolean gunFlashEffect=true;
         public int shellEffectCapacity=64;
+        public Float aimBodySettleSeconds = 0.5f;
+        /** SS aim: body turns toward yellow ray when yaw/pitch delta exceeds this (deg). Null → 20. */
+        public Float aimShoulderBodyCorrectDegrees = 20f;
+        /** Ride: max |upper-body twist| vs seat yaw (deg). Null → 120. */
+        public Float aimRideUpperBodyMaxDegrees = 120f;
     }
 
     //shots
@@ -217,6 +222,8 @@ public class ModConfig {
         public int hotbarSoftPinMs = 15000;
         public int idleUnloadSeconds = 90;
         public boolean keepAnimAfterUnload = false;
+        public boolean skinAnimOpt = false;
+        public boolean renderSchedulingOpt = false;
     }
 
     public String version = ModularWarfare.MOD_VERSION;

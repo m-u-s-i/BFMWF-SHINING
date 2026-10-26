@@ -4,13 +4,22 @@ import com.modularwarfare.ModConfig;
 import com.modularwarfare.ModularWarfare;
 import com.modularwarfare.api.EntityShootingAPI;
 import com.modularwarfare.api.ballistics.GetLivingAABBEvent;
+import com.modularwarfare.client.ClientProxy;
 import com.modularwarfare.client.ClientRenderHooks;
 import com.modularwarfare.common.entity.grenades.EntityGrenade;
 import com.modularwarfare.common.guns.*;
 import com.modularwarfare.common.handler.ServerTickHandler;
 import com.modularwarfare.common.playerstate.PlayerStateManager;
 import com.modularwarfare.utility.raycast.hits.BulletHit;
+import com.modularwarfare.utility.raycast.obb.EntityOBBManager;
+import com.modularwarfare.utility.raycast.obb.OBBModelBox;
+import com.modularwarfare.utility.raycast.obb.OBBModelBox.RayCastResult;
+import com.modularwarfare.utility.raycast.obb.OBBModelObject;
+import com.modularwarfare.utility.raycast.obb.OBBPlayerManager;
 import com.modularwarfare.client.fpp.basic.renderers.RenderParameters;
+import com.modularwarfare.utility.vector.Vector3f;
+import com.teamderpy.shouldersurfing.client.ShoulderHelper;
+import com.teamderpy.shouldersurfing.client.ShoulderInstance;
 import mchhui.modularmovements.coremod.ModularMovementsHooks;
 import mchhui.modularmovements.tactical.client.ClientListener;
 import mchhui.modularmovements.tactical.server.ServerListener;
@@ -22,6 +31,8 @@ import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.inventory.EntityEquipmentSlot;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.DamageSource;
+import net.minecraft.util.EntitySelectors;
+import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.RayTraceResult;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
@@ -34,7 +45,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.ArrayList;
-import net.minecraft.util.math.AxisAlignedBB;
 
 public class RayUtil {
 
@@ -335,6 +345,214 @@ public class RayUtil {
         return entity.world.rayTraceBlocks(vec3d, vec3d2, false, true, false);
     }
 
+    @Nullable
+    @SideOnly(Side.CLIENT)
+    public static RayTraceResult rayTraceColliding(Entity entity, double blockReachDistance, float partialTicks) {
+        Vec3d start = entity.getPositionEyes(partialTicks);
+        if (ClientProxy.shoulderSurfingLoaded) {
+            try {
+                if (ShoulderInstance.getInstance().doShoulderSurfing()) {
+                    ShoulderHelper.ShoulderLook look = ShoulderHelper.shoulderSurfingLook(
+                        entity, partialTicks, blockReachDistance * blockReachDistance);
+                    start = start.add(look.headOffset());
+                    return traceBlocksToRange(entity.world, start, look.traceEndPos());
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        Vec3d look = entity.getLook(partialTicks);
+        Vec3d end = start.add(look.x * blockReachDistance, look.y * blockReachDistance, look.z * blockReachDistance);
+        return traceBlocksToRange(entity.world, start, end);
+    }
+
+    /** Segment long aim rays to avoid vanilla's 200 voxel-step traversal cap. */
+    public static RayTraceResult traceBlocksToRange(World world, Vec3d start, Vec3d end) {
+        double length = start.distanceTo(end);
+        if (!Double.isFinite(length) || length > 4096) return null;
+        int segments = Math.max(1, (int) Math.ceil(length / 64.0));
+        Vec3d step = end.subtract(start).scale(1.0 / segments);
+        Vec3d previous = start;
+        for (int i = 1; i <= segments; i++) {
+            Vec3d next = i == segments ? end : start.add(step.scale(i));
+            RayTraceResult hit = world.rayTraceBlocks(previous, next, false, true, false);
+            if (hit != null && hit.typeOfHit == RayTraceResult.Type.BLOCK) return hit;
+            previous = next;
+        }
+        return null;
+    }
+
+    @Nullable
+    @SideOnly(Side.CLIENT)
+    public static RayTraceResult shoulderCrosshairPick(Entity viewer, float partialTicks, double range) {
+        if (viewer == null || viewer.world == null) {
+            return null;
+        }
+        RayTraceResult blockHit = rayTraceColliding(viewer, range, partialTicks);
+        Vec3d from = shoulderAimOrigin(viewer, partialTicks, range);
+        Vec3d end = shoulderAimEnd(viewer, partialTicks, range);
+        Vec3d look = end.subtract(from).normalize();
+        double maxDist = from.distanceTo(end);
+        if (blockHit != null && blockHit.hitVec != null) {
+            maxDist = blockHit.hitVec.distanceTo(from);
+        }
+        end = from.add(look.x * maxDist, look.y * maxDist, look.z * maxDist);
+
+        RayTraceResult best = null;
+        double bestDist = maxDist;
+
+        RayTraceResult obbHit = nearestObbHit(viewer, from, end);
+        if (obbHit != null && obbHit.hitVec != null) {
+            double d = from.distanceTo(obbHit.hitVec);
+            if (d < bestDist) {
+                best = obbHit;
+                bestDist = d;
+            }
+        }
+
+        AxisAlignedBB search = new AxisAlignedBB(from.x, from.y, from.z, end.x, end.y, end.z).grow(2.0D);
+        List<Entity> list = viewer.world.getEntitiesInAABBexcluding(viewer, search, EntitySelectors.NOT_SPECTATING);
+        for (Entity ent : list) {
+            if (ent == null || !ent.canBeCollidedWith()) {
+                continue;
+            }
+            if (EntityOBBManager.hasEntityOBB(ent.getUniqueID())) {
+                continue;
+            }
+            if (ent instanceof EntityPlayer && OBBPlayerManager.getPlayerOBBObject(ent.getName()) != null) {
+                continue;
+            }
+            if (ent.getLowestRidingEntity() == viewer.getLowestRidingEntity() && !ent.canRiderInteract()) {
+                continue;
+            }
+            AxisAlignedBB aabb = ent.getEntityBoundingBox().grow(ent.getCollisionBorderSize());
+            RayTraceResult intercept = aabb.calculateIntercept(from, end);
+            if (aabb.contains(from)) {
+                if (bestDist >= 0.0D) {
+                    best = new RayTraceResult(ent, intercept == null ? from : intercept.hitVec);
+                    bestDist = 0.0D;
+                }
+            } else if (intercept != null) {
+                double d = from.distanceTo(intercept.hitVec);
+                if (d < bestDist) {
+                    best = new RayTraceResult(ent, intercept.hitVec);
+                    bestDist = d;
+                }
+            }
+        }
+
+        if (best != null && (bestDist < maxDist || blockHit == null)) {
+            return best;
+        }
+        return blockHit;
+    }
+
+    @SideOnly(Side.CLIENT)
+    public static Vec3d shoulderAimOrigin(Entity viewer, float partialTicks, double range) {
+        if (viewer == null) return Vec3d.ZERO;
+        if (ClientProxy.shoulderSurfingLoaded) {
+            try {
+                if (ShoulderInstance.getInstance().doShoulderSurfing()) {
+                    return ShoulderHelper.shoulderSurfingLook(viewer, partialTicks, range * range).cameraPos();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return viewer.getPositionEyes(partialTicks);
+    }
+
+    @SideOnly(Side.CLIENT)
+    public static Vec3d shoulderAimEnd(Entity viewer, float partialTicks, double range) {
+        if (viewer == null) return Vec3d.ZERO;
+        if (ClientProxy.shoulderSurfingLoaded) {
+            try {
+                if (ShoulderInstance.getInstance().doShoulderSurfing()) {
+                    // ShoulderHelper takes squared reach, just like rayTraceColliding above.
+                    return ShoulderHelper.shoulderSurfingLook(viewer, partialTicks, range * range).traceEndPos();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        Vec3d origin = viewer.getPositionEyes(partialTicks);
+        Vec3d look = viewer.getLook(partialTicks);
+        return origin.add(look.x * range, look.y * range, look.z * range);
+    }
+
+    @Nullable
+    @SideOnly(Side.CLIENT)
+    private static RayTraceResult nearestObbHit(Entity viewer, Vec3d origin, Vec3d endVec) {
+        Vector3f rayVec = new Vector3f(
+            (float) (endVec.x - origin.x),
+            (float) (endVec.y - origin.y),
+            (float) (endVec.z - origin.z));
+        float rayLength = rayVec.length();
+        if (rayLength < 1.0E-6F) {
+            return null;
+        }
+        rayVec.scale(1.0F / rayLength);
+
+        OBBModelBox ray = new OBBModelBox();
+        ray.center = new Vector3f(
+            (float) ((origin.x + endVec.x) * 0.5F),
+            (float) ((origin.y + endVec.y) * 0.5F),
+            (float) ((origin.z + endVec.z) * 0.5F));
+        ray.axis.x = new Vector3f(0, 0, 0);
+        ray.axis.y = new Vector3f(0, 0, 0);
+        ray.axis.z = new Vector3f(
+            rayVec.x * rayLength * 0.5F,
+            rayVec.y * rayLength * 0.5F,
+            rayVec.z * rayLength * 0.5F);
+        Vector3f up = new Vector3f(0, 1, 0);
+        Vector3f right = Vector3f.cross(rayVec, up, null);
+        if (right.lengthSquared() < 1.0E-6F) {
+            right = new Vector3f(1, 0, 0);
+        }
+        right.normalise();
+        Vector3f upCross = Vector3f.cross(right, rayVec, null);
+        upCross.normalise();
+        ray.axisNormal.x = right;
+        ray.axisNormal.y = upCross;
+        ray.axisNormal.z = new Vector3f(rayVec);
+
+        RayTraceResult best = null;
+        double bestT = Double.MAX_VALUE;
+        Vector3f startVector = new Vector3f(origin);
+
+        for (Entity ent : viewer.world.loadedEntityList) {
+            if (ent == null || ent == viewer || ent.isDead) {
+                continue;
+            }
+            if (ent instanceof EntityPlayer && ((EntityPlayer) ent).isSpectator()) {
+                continue;
+            }
+            if (ent.getLowestRidingEntity() == viewer.getLowestRidingEntity() && !ent.canRiderInteract()) {
+                continue;
+            }
+            OBBModelObject obbObject = EntityOBBManager.getEntityOBB(ent.getUniqueID());
+            if (obbObject == null && ent instanceof EntityPlayer) {
+                obbObject = OBBPlayerManager.getPlayerOBBObject(ent.getName());
+            }
+            if (obbObject == null || obbObject.boxes == null || obbObject.boxes.isEmpty()) {
+                continue;
+            }
+            List<OBBModelBox> boxes = obbObject.calculateIntercept(ray);
+            if (boxes.isEmpty()) {
+                continue;
+            }
+            for (OBBModelBox box : boxes) {
+                RayCastResult temp = OBBModelBox.testCollisionOBBAndRay(box, startVector, rayVec);
+                if (temp.t < bestT && temp.t <= rayLength) {
+                    bestT = temp.t;
+                    Vec3d hitPoint = new Vec3d(
+                        origin.x + rayVec.x * bestT,
+                        origin.y + rayVec.y * bestT,
+                        origin.z + rayVec.z * bestT);
+                    best = new RayTraceResult(ent, hitPoint);
+                }
+            }
+        }
+        return best;
+    }
+
     /**
      * Attacks the given entity with the given damage source and amount, but
      * preserving the entity's original velocity instead of applying knockback
@@ -443,6 +661,17 @@ public class RayUtil {
      */
     @Nullable
     public static List<BulletHit> standardEntityRayTraceForEntity(Side side, World world, float rotationPitch, float rotationYaw, EntityLivingBase entity, double range, ItemGun item, boolean isPunched, ItemStack weaponStack) {
+        return standardEntityRayTraceForEntity(side, world, rotationPitch, rotationYaw, entity, range, item, isPunched, weaponStack, null);
+    }
+
+    public static List<BulletHit> standardEntityRayTraceForEntity(Side side, World world, float rotationPitch, float rotationYaw,
+            EntityLivingBase entity, double range, ItemGun item, boolean isPunched, ItemStack weaponStack, Vec3d shotOrigin) {
+        return standardEntityRayTraceForEntity(side, world, rotationPitch, rotationYaw, entity, range, item, isPunched, weaponStack, shotOrigin, null);
+    }
+
+    public static List<BulletHit> standardEntityRayTraceForEntity(Side side, World world, float rotationPitch, float rotationYaw,
+            EntityLivingBase entity, double range, ItemGun item, boolean isPunched, ItemStack weaponStack,
+            Vec3d shotOrigin, Float spreadOverride) {
         if (world == null || entity == null || item == null || item.type == null) {
             return null;
         }
@@ -455,14 +684,15 @@ public class RayUtil {
         hashset.add(entity);
 
         try {
-            float accuracy = EntityShootingAPI.calculateServerAccuracy(item, entity);
+            float accuracy = spreadOverride == null ? EntityShootingAPI.calculateServerAccuracy(item, entity) : spreadOverride;
+            if (!Float.isFinite(accuracy) || accuracy < 0) return null;
             float penetrate = item.type.gunPenetrateSize;
             float maxPenetrateBlockResistance = item.type.gunMaxPenetrateBlockResistance;
             float penetrateBlocksResistance = item.type.gunPenetrateBlocksResistance;
 
             ItemBullet usedBullet = null;
             if (weaponStack != null) {
-                usedBullet = ItemAmmo.getUsedBullet(weaponStack);
+                usedBullet = ItemGun.getUsedBullet(weaponStack, item.type);
             }
             
             if (usedBullet != null) {
@@ -478,13 +708,24 @@ public class RayUtil {
                 dir = getGunAccuracy(rotationPitch, rotationYaw, accuracy, world.rand, entity);
             }
 
-            Vec3d origin = entity.getPositionEyes(1.0f);
+            Vec3d origin = shotOrigin != null ? shotOrigin : entity.getPositionEyes(1.0f);
 
             int ping = 0;
 
 
             if (side.isServer()) {
-                return performSimpleAABBRayTrace(world, origin, dir, range, penetrate, maxPenetrateBlockResistance, penetrateBlocksResistance, hashset);
+                List<BulletHit> hits = performSimpleAABBRayTrace(world, origin, dir, range, penetrate,
+                        maxPenetrateBlockResistance, penetrateBlocksResistance, hashset);
+                if (EntityShootingAPI.isDebugShot()) {
+                    Vec3d end = origin.add(dir.scale(range));
+                    for (BulletHit hit : hits) {
+                        if (hit.rayTraceResult != null && hit.rayTraceResult.typeOfHit == RayTraceResult.Type.BLOCK) {
+                            end = hit.rayTraceResult.hitVec; break;
+                        }
+                    }
+                    MinecraftForge.EVENT_BUS.post(new EntityShootingAPI.ShotTraceEvent(entity, origin, end, hits));
+                }
+                return hits;
             } else {
             return ModularWarfare.INSTANCE.RAY_CASTING.computeDetection(world, origin, dir, range, 0.001f, penetrate,
                     maxPenetrateBlockResistance, penetrateBlocksResistance, hashset, false, ping);
@@ -505,7 +746,7 @@ public class RayUtil {
         
         Vec3d endVec = origin.add(dir.scale(range));
         
-        RayTraceResult blockResult = world.rayTraceBlocks(origin, endVec, false, true, false);
+        RayTraceResult blockResult = traceBlocksToRange(world, origin, endVec);
         if (blockResult != null && blockResult.typeOfHit == RayTraceResult.Type.BLOCK) {
             double distance = blockResult.hitVec.distanceTo(origin);
             hits.add(new BulletHit(blockResult, distance, 0.0f, 0.0f));

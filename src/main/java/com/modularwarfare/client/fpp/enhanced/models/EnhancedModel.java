@@ -9,6 +9,7 @@ import mchhui.hegltf.DataAnimation;
 import mchhui.hegltf.DataAnimation.Transform;
 import mchhui.hegltf.DataNode;
 import mchhui.hegltf.GltfDataModel;
+import mchhui.hegltf.GltfFeatureFlags;
 import mchhui.hegltf.GltfLoadPriority;
 import mchhui.hegltf.GltfModelHandle;
 import mchhui.hegltf.GltfModelManager;
@@ -48,6 +49,9 @@ public class EnhancedModel implements IMWModel {
     private boolean cachedBasicSprint;
     private boolean poseCacheValid = false;
     private boolean skinnedForCachedPose = false;
+
+    private float elmThirdIdleTime = Float.NaN;
+    private boolean elmThirdIdleReady = false;
 
     public EnhancedModel(EnhancedRenderConfig config, BaseType baseType) {
         this.config = config;
@@ -159,6 +163,42 @@ public class EnhancedModel implements IMWModel {
         poseCacheValid = false;
         skinnedForCachedPose = false;
         cachedPoseTime = Float.NaN;
+        elmThirdIdleReady = false;
+        elmThirdIdleTime = Float.NaN;
+    }
+
+    public void ensureThirdIdleCached(float time) {
+        if (model == null || !isAnimReady()) {
+            return;
+        }
+        if (!initCal || !elmThirdIdleReady || Float.compare(elmThirdIdleTime, time) != 0) {
+            initCal = model.updatePose(time);
+            if (!initCal) {
+                elmThirdIdleReady = false;
+                return;
+            }
+            model.clearThirdIdleSkinMark();
+            skinnedForCachedPose = false;
+        }
+        elmThirdIdleTime = time;
+        elmThirdIdleReady = true;
+        poseCacheValid = true;
+        cachedPoseTime = time;
+
+        if (model.isThirdIdleSkinReady(time) && skinnedForCachedPose && model.hasInitializedSkinBuffers()) {
+            return;
+        }
+        if (!isMeshReady()) {
+            skinnedForCachedPose = false;
+            return;
+        }
+        model.skinFromPose();
+        if (!model.hasInitializedSkinBuffers()) {
+            skinnedForCachedPose = false;
+            return;
+        }
+        model.markThirdIdleSkin(time);
+        skinnedForCachedPose = true;
     }
 
     public void updateAnimationBlended(float time, boolean skin, boolean basicSprint, float sprintTime,
@@ -167,7 +207,7 @@ public class EnhancedModel implements IMWModel {
             return;
         }
         boolean forceSkinFirst = !initCal;
-        boolean samePose = poseCacheValid && initCal
+        boolean samePose = GltfFeatureFlags.skinAnimOpt() && poseCacheValid && initCal
                 && Float.compare(cachedPoseTime, time) == 0
                 && Float.compare(cachedSprintTime, sprintTime) == 0
                 && Float.compare(cachedSprintAlpha, sprintAlpha) == 0

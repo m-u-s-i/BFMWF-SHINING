@@ -72,10 +72,19 @@ public class DataMesh {
         }
         batchBoundVao = 0;
         batchActive = false;
+        GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, 0);
         if (batchTouchedSkinDraw) {
             GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
             batchTouchedSkinDraw = false;
         }
+    }
+
+    /** Unbind batched VAO before client-state scrub. */
+    public static void unbindForClientStateScrub() {
+        if (batchBoundVao > 0 || !batchActive) {
+            GL30.glBindVertexArray(0);
+        }
+        batchBoundVao = -1;
     }
 
     private static void bindBatchVao(int vao) {
@@ -105,6 +114,10 @@ public class DataMesh {
 
     public boolean isCompiled() {
         return compiled;
+    }
+
+    public boolean isSkinInitialized() {
+        return initSkinning;
     }
 
     public void requestUpload(String name, boolean priority, Runnable onComplete) {
@@ -154,12 +167,31 @@ public class DataMesh {
 
     public void render() {
         if (!this.compiled) {
-            if (!uploadQueued) {
-                requestUpload("onDemand", true, null);
+            if (!GltfModelManager.isLazyEnabled()) {
+                try {
+                    if (!uploadCancelled) {
+                        compileVAOSliced();
+                    }
+                } catch (Throwable t) {
+                    t.printStackTrace();
+                }
+                if (!this.compiled) {
+                    return;
+                }
+            } else {
+                if (!uploadQueued) {
+                    requestUpload("onDemand", true, null);
+                }
+                return;
             }
-            return;
         }
-        boolean atomicGlow = ObjModelRenderer.glowTxtureMode
+        if (AtomicShaderCompat.isGBufferFillActive() || AtomicShaderCompat.isShadowDepthActive()) {
+            AtomicShaderCompat.rebindFillAndGunPbr();
+        } else if (!GltfFeatureFlags.renderSchedulingOpt()) {
+            AtomicShaderCompat.rebindFillAndGunPbr();
+        }
+        boolean atomicFlat = AtomicShaderCompat.applyMeshFlatEmissiveIfActive();
+        boolean atomicGlow = !atomicFlat && ObjModelRenderer.glowTxtureMode
             && AtomicShaderCompat.prepareGlowMapEmissive(ObjModelRenderer.glowType, ObjModelRenderer.glowPath);
         this.callVAO();
         if (atomicGlow) {
@@ -220,11 +252,12 @@ public class DataMesh {
 
         if (this.unit == 3) {
             final List<Float> list = this.geoList;
-            this.vertexCount = list.size() / this.unit;
+            // unit==3 is a rigid-mesh type tag; each vertex is 8 floats (pos3+uv2+n3).
+            this.vertexCount = list.size() / 8;
 
-            FloatBuffer pos_floatBuffer = BufferUtils.createFloatBuffer(vertexCount * 3);
-            FloatBuffer tex_floatBuffer = BufferUtils.createFloatBuffer(vertexCount * 2);
-            FloatBuffer normal_floatBuffer = BufferUtils.createFloatBuffer(vertexCount * 3);
+            FloatBuffer pos_floatBuffer = BufferUtils.createFloatBuffer(Math.max(vertexCount, 1) * 3);
+            FloatBuffer tex_floatBuffer = BufferUtils.createFloatBuffer(Math.max(vertexCount, 1) * 2);
+            FloatBuffer normal_floatBuffer = BufferUtils.createFloatBuffer(Math.max(vertexCount, 1) * 3);
 
             for (int i = 0, size = list.size(); i + 8 <= size; i += 8) {
                 pos_floatBuffer.put(list.get(i));
@@ -240,6 +273,7 @@ public class DataMesh {
             tex_floatBuffer.flip();
             normal_floatBuffer.flip();
 
+            OpenGlHelper.setClientActiveTexture(OpenGlHelper.defaultTexUnit);
             GL30.glBindVertexArray(this.displayList);
             GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY);
             GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY);
@@ -312,6 +346,7 @@ public class DataMesh {
             uploadBufferSliced(GL43.GL_SHADER_STORAGE_BUFFER, this.ssbo, this.geoBuffer, partSize);
             GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
+            OpenGlHelper.setClientActiveTexture(OpenGlHelper.defaultTexUnit);
             GL30.glBindVertexArray(this.ssboVao);
             GL11.glEnableClientState(GL11.GL_VERTEX_ARRAY);
             GL11.glEnableClientState(GL11.GL_TEXTURE_COORD_ARRAY);
@@ -391,8 +426,12 @@ public class DataMesh {
         if (this.skin) {
             GL30.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, ShaderGltf.VERTEXBUFFERBINDING, this.ssbo);
             GL30.glBindVertexArray(this.displayList);
+            if (this.ebo > 0) {
+                GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, this.ebo);
+            }
             GL11.glDrawElements(this.glDrawingMode, this.elementCount, GL11.GL_UNSIGNED_INT, 0);
             GL30.glBindVertexArray(0);
+            GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, 0);
             GL42.glMemoryBarrier(GL43.GL_SHADER_STORAGE_BARRIER_BIT);
             this.initSkinning = true;
         }
@@ -408,16 +447,34 @@ public class DataMesh {
             }
             bindBatchVao(this.ssboVao);
             batchTouchedSkinDraw = true;
+            AtomicShaderCompat.reapplyMeshTintGlIfActive();
+            restampLightmapCoordsAfterVao();
+            if (this.ebo > 0) {
+                GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, this.ebo);
+            }
             GL11.glDrawElements(this.glDrawingMode, this.elementCount, GL11.GL_UNSIGNED_INT, 0);
             unbindBatchVao();
             if (!batchActive) {
+                GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, 0);
                 GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
             }
         } else {
             bindBatchVao(this.displayList);
+            AtomicShaderCompat.reapplyMeshTintGlIfActive();
+            restampLightmapCoordsAfterVao();
             GL11.glDrawArrays(this.glDrawingMode, 0, this.vertexCount);
             unbindBatchVao();
         }
+    }
+
+    private static void restampLightmapCoordsAfterVao() {
+        if (!AtomicShaderCompat.isGBufferFillActive() || AtomicShaderCompat.isShadowDepthActive()) {
+            return;
+        }
+        OpenGlHelper.setLightmapTextureCoords(
+                OpenGlHelper.lightmapTexUnit,
+                OpenGlHelper.lastBrightnessX,
+                OpenGlHelper.lastBrightnessY);
     }
 
     public void delete() {
