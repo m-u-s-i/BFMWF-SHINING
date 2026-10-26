@@ -31,7 +31,7 @@ public class ReloadHelper {
         NBTTagCompound nbtTagCompound = ammoStack.getTagCompound();
         int ammoCount = 0;
         if (!nbtTagCompound.hasKey("magcount")) {
-            ammoCount = ammoStack.getTagCompound().getInteger("ammocount");
+            ammoCount = nbtTagCompound.getInteger("ammocount");
         } else {
             if(currentMagcount!=null) {
                 ammoCount = ammoStack.getTagCompound().getInteger("ammocount"+currentMagcount);
